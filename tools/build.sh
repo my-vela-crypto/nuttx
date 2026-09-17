@@ -14,6 +14,34 @@
 # limitations under the License.
 #
 
+function setup_host_cmake_tools()
+{
+  # envsetup.sh always adds prebuilts/tools/cmake (x86_64) to PATH. On ARM
+  # hosts, prepend the matching linux-aarch64 cmake/ninja prebuilts instead.
+  local host_arch
+  host_arch="$(uname -m)"
+
+  case "${host_arch}" in
+    aarch64|arm64)
+      local cmake_bin="${ROOTDIR}/prebuilts/cmake/linux-aarch64/bin"
+      local ninja_bin="${ROOTDIR}/prebuilts/build-tools/linux-aarch64/bin"
+
+      if [ -x "${cmake_bin}/cmake" ] && [ -x "${ninja_bin}/ninja" ]; then
+        export PATH="${cmake_bin}:${ninja_bin}:${PATH}"
+        echo "Host arch ${host_arch}: using linux-aarch64 cmake and ninja"
+        return 0
+      fi
+
+      echo "Error: ARM host prebuilts not found." >&2
+      echo "  Expected: ${cmake_bin}/cmake" >&2
+      echo "  Expected: ${ninja_bin}/ninja" >&2
+      echo "Run 'repo sync -c -j8' in the openvela root, or:" >&2
+      echo "  sudo apt install cmake ninja-build" >&2
+      exit 1
+      ;;
+  esac
+}
+
 function cleanup()
 {
   # keep the mapping but change to the link since:
@@ -231,6 +259,7 @@ board_config=$1
 shift
 
 source ${ROOTDIR}/build/envsetup.sh
+setup_host_cmake_tools
 
 EXTRA_FLAGS="-Wno-cpp -Wno-deprecated-declarations"
 while [[ "$1" == "-e" ]]; do
