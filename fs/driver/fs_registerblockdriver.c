@@ -21,7 +21,7 @@
  ****************************************************************************/
 
 /****************************************************************************
- * Included Files
+ * 包含的头文件
  ****************************************************************************/
 
 #include <nuttx/config.h>
@@ -37,29 +37,28 @@
 #ifndef CONFIG_DISABLE_MOUNTPOINT
 
 /****************************************************************************
- * Public Functions
+ * 对外提供的函数
  ****************************************************************************/
 
 /****************************************************************************
  * Name: register_blockdriver
  *
- * Description:
- *   Register a block driver inode the pseudo file system.
+ * 说明:
+ *   在伪文件系统里登记一个块设备的 inode，
+ *   也就是在设备名单上新建一张登记卡。
  *
- * Input Parameters:
- *   path - The path to the inode to create
- *   bops - The block driver operations structure
- *   mode - inmode privileges
- *   priv - Private, user data that will be associated with the inode.
+ * 参数:
+ *   path - 要创建的登记卡路径
+ *   bops - 块设备的值班表
+ *   mode - 访问权限
+ *   priv - 要挂在这张登记卡上的私人数据
  *
- * Returned Value:
- *   Zero on success (with the inode point in 'inode'); A negated errno
- *   value is returned on a failure (all error values returned by
- *   inode_reserve):
+ * 返回值:
+ *   成功返回 0。失败返回负数，这些错误都来自内部的 inode_reserve：
  *
- *   EINVAL - 'path' is invalid for this operation
- *   EEXIST - An inode already exists at 'path'
- *   ENOMEM - Failed to allocate in-memory resources for the operation
+ *   EINVAL - 这个 path 不能用于本次操作
+ *   EEXIST - 这个路径上已经有登记卡
+ *   ENOMEM - 内存不够，登记卡分配失败
  *
  ****************************************************************************/
 
@@ -70,18 +69,17 @@ int register_blockdriver(FAR const char *path,
   FAR struct inode *node;
   int ret;
 
-  /* Insert an inode for the device driver -- we need to hold the inode
-   * semaphore to prevent access to the tree while we this.  This is because
-   * we will have a momentarily bad true until we populate the inode with
-   * valid data.
+  /* 为这个设备插入一张登记卡。
+   * 插入期间先锁住整棵登记卡树，避免别人同时来查。
+   * 卡刚放进去、值班表和私人数据还没填上时，这张卡是不完整的。
    */
 
   inode_lock();
   ret = inode_reserve_path(path, mode, &node);
   if (ret >= 0)
     {
-      /* We have it, now populate it with block driver specific information.
-       * NOTE that the initial reference count on the new inode is zero.
+      /* 卡已经拿到了，现在填上块设备专有的信息。
+       * inode_reserve 会把使用人数设成 1，表示这张卡还挂在名单上。
        */
 
       INODE_SET_BLOCK(node);
@@ -99,4 +97,4 @@ int register_blockdriver(FAR const char *path,
   return ret;
 }
 
-#endif /* !CONFIG_DISABLE_MOUNTPOINT */
+#endif /* 只有允许挂载磁盘时才编译这个函数 */

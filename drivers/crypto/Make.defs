@@ -34,6 +34,10 @@ ifeq ($(CONFIG_CRYPTO_RPMSG_SERVER),y)
   CSRCS += rpmsg_crypto_server.c
 endif
 
+ifeq ($(CONFIG_BLKCRYPT),y)
+  CSRCS += blkcrypt.c blkcrypt_xts.c
+endif
+
 ifeq ($(CONFIG_DEV_SE05X),y)
   CSRCS += se05x.c
   include crypto/pnt/Make.defs

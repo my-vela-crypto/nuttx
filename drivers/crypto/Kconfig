@@ -147,3 +147,20 @@ config SE05X_LOG_DEBUG
 endchoice # SE05x debug log level
 
 endif #DEV_SE05X
+
+config BLKCRYPT
+	bool "块加密设备（blkcrypt，透明扇区加密）"
+	default n
+	depends on CRYPTO_SW_AES
+	depends on !DISABLE_MOUNTPOINT
+	---help---
+		在另一块磁盘前面挂出 /dev/encdata0。
+		FAT 看到的是普通磁盘，写进底下那块盘的每一格都是 XTS-AES-128 密文。
+
+		对外函数在 include/nuttx/crypto/blkcrypt.h：
+		blkcrypt_register、blkcrypt_set_key、blkcrypt_unregister。
+
+		aes_encrypt 来自 crypto/aes.c，只有打开下面几项才会被编译：
+		CONFIG_ALLOW_BSD_COMPONENTS、CONFIG_CRYPTO、CONFIG_CRYPTO_SW_AES。
+		CONFIG_CRYPTO_AES 是另一套接口，goldfish 上没有对应的软件实现，
+		打开它并不能提供本驱动需要的 aes_setkey。

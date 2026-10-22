@@ -31,3 +31,7 @@ endif()
 if(CONFIG_CRYPTO_RPMSG_SERVER)
   target_sources(drivers PRIVATE rpmsg_crypto_server.c)
 endif()
+
+if(CONFIG_BLKCRYPT)
+  target_sources(drivers PRIVATE blkcrypt.c blkcrypt_xts.c)
+endif()
