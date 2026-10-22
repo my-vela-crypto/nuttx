@@ -76,7 +76,7 @@
     defined(CONFIG_FS_CROMFS) || defined(CONFIG_FS_UNIONFS) || \
     defined(CONFIG_FS_HOSTFS) || defined(CONFIG_FS_ZIPFS) || \
     defined(CONFIG_FS_RPMSGFS) || defined(CONFIG_FS_V9FS) || \
-    defined(CONFIG_FS_ARCHIVEFS)
+    defined(CONFIG_FS_ARCHIVEFS) || defined(CONFIG_FS_ENCPATHFS)
 #  define NODFS_SUPPORT
 #endif
 
@@ -204,6 +204,9 @@ extern const struct mountpt_operations g_cromfs_operations;
 #ifdef CONFIG_FS_UNIONFS
 extern const struct mountpt_operations g_unionfs_operations;
 #endif
+#ifdef CONFIG_FS_ENCPATHFS
+extern const struct mountpt_operations g_encpathfs_operations;
+#endif
 #ifdef CONFIG_FS_RPMSGFS
 extern const struct mountpt_operations g_rpmsgfs_operations;
 #endif
@@ -245,6 +248,9 @@ static const struct fsmap_t g_nonbdfsmap[] =
 #endif
 #ifdef CONFIG_FS_UNIONFS
     { "unionfs", &g_unionfs_operations },
+#endif
+#ifdef CONFIG_FS_ENCPATHFS
+    { "encpathfs", &g_encpathfs_operations },
 #endif
 #ifdef CONFIG_FS_RPMSGFS
     { "rpmsgfs", &g_rpmsgfs_operations },
@@ -321,6 +327,7 @@ int nx_mount(FAR const char *source, FAR const char *target,
   FAR const struct mountpt_operations *mops = NULL;
 #ifndef CONFIG_DISABLE_PSEUDOFS_OPERATIONS
   struct inode_search_s desc;
+  bool target_ref = false;
 #endif
   FAR void *fshandle = NULL;
   int ret;
@@ -424,6 +431,8 @@ int nx_mount(FAR const char *source, FAR const char *target,
           inode_release(mountpt_inode);
           goto errout_with_lock;
         }
+
+      target_ref = true;
     }
 #endif
 
@@ -483,6 +492,34 @@ int nx_mount(FAR const char *source, FAR const char *target,
       goto errout_with_lock;
     }
 
+#ifndef CONFIG_DISABLE_PSEUDOFS_OPERATIONS
+  if (target_ref)
+    {
+      struct inode_search_s current;
+
+      /* bind ran without the tree lock.  A lookup reference keeps the old
+       * inode allocated, but does not prevent rmdir/rename from detaching
+       * it or another mount from claiming it.  Publish only to the same
+       * still-visible pseudo directory that was checked before bind.
+       */
+
+      SETUP_SEARCH(&current, target, false);
+      ret = inode_search(&current);
+      if (ret >= 0 && (current.node != mountpt_inode ||
+                       current.relpath[0] != '\0' ||
+                       !INODE_IS_PSEUDODIR(current.node)))
+        {
+          ret = -EBUSY;
+        }
+
+      RELEASE_SEARCH(&current);
+      if (ret < 0)
+        {
+          goto errout_with_bind;
+        }
+    }
+#endif
+
   /* Insert a dummy node -- we need to hold the inode semaphore
    * to do this because we will have a momentarily bad structure.
    * NOTE that the new inode will be created with an initial reference
@@ -521,6 +558,18 @@ int nx_mount(FAR const char *source, FAR const char *target,
 
   mountpt_inode->u.i_mops  = mops;
   mountpt_inode->i_private = fshandle;
+#ifndef CONFIG_DISABLE_PSEUDOFS_OPERATIONS
+  if (target_ref)
+    {
+      /* inode_find added a lookup reference to an existing pseudo target.
+       * Keep only its original namespace reference, as for a new target.
+       */
+
+      inode_release(mountpt_inode);
+      target_ref = false;
+    }
+#endif
+
   inode_unlock();
 
   /* We can release our reference to the blkdrver_inode, if the filesystem
@@ -551,10 +600,28 @@ int nx_mount(FAR const char *source, FAR const char *target,
 errout_with_bind:
   if (mops->unbind != NULL)
     {
-      mops->unbind(fshandle, &drvr_inode, 0);
+      FAR struct inode *bound_inode = NULL;
+
+      /* unbind transfers back the reference owned by the filesystem.
+       * Keep it separate from our original find_blockdriver reference;
+       * both must be released when publication of a block mount fails.
+       */
+
+      if (mops->unbind(fshandle, &bound_inode, 0) == 0 &&
+          bound_inode != NULL)
+        {
+          inode_release(bound_inode);
+        }
     }
 
 errout_with_lock:
+#ifndef CONFIG_DISABLE_PSEUDOFS_OPERATIONS
+  if (target_ref)
+    {
+      inode_release(mountpt_inode);
+    }
+#endif
+
   inode_unlock();
 #ifndef CONFIG_DISABLE_PSEUDOFS_OPERATIONS
   RELEASE_SEARCH(&desc);

@@ -43,6 +43,7 @@
 
 #include <debug.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -70,6 +71,7 @@ struct blkcrypt_priv_s
   blksize_t         sectorsize; /* 一格多少字节，也是一次加密的长度 */
   mutex_t           lock;     /* 同一时刻只允许一个人使用钥匙和草稿纸 */
   bool              key_set;  /* 钥匙装好了才允许读和写 */
+  unsigned int      opens;    /* 成功打开次数，受 lock 保护 */
 
   AES_CTX           key1;     /* K1 的计算表：加密、解密格子内容 */
   AES_CTX           key2;     /* K2 的计算表：只加密格子号 */
@@ -88,6 +90,12 @@ struct blkcrypt_priv_s
 
 void inode_addref(FAR struct inode *inode);
 void inode_release(FAR struct inode *inode);
+void inode_lock(void);
+void inode_unlock(void);
+int inode_remove(FAR const char *path);
+#ifdef CONFIG_FS_NOTIFY
+void notify_unlink(FAR const char *path);
+#endif
 
 static int     blkcrypt_open(FAR struct inode *inode);
 static int     blkcrypt_close(FAR struct inode *inode);
@@ -139,26 +147,50 @@ static const struct block_operations g_blkcrypt_bops =
  *
  * Description:
  *   在已经拿着门锁的前提下装钥匙。
- *   装失败时把“可以读写”关掉，并擦掉算了一半的表，避免留下半把旧钥匙。
+ *   使用临时计算表；任何失败都保留原来可用的钥匙。
+ *   已有钥匙且设备正在使用时，拒绝换钥匙。
  *
  ****************************************************************************/
 
 static int blkcrypt_install_key(FAR struct blkcrypt_priv_s *dev,
                                 FAR const uint8_t *key, size_t keylen)
 {
+  FAR AES_CTX *keys;
   int ret;
 
-  ret = blkcrypt_xts_setkey(&dev->key1, &dev->key2, key, keylen);
-  if (ret < 0)
+  if (dev->key_set && dev->opens != 0)
     {
-      explicit_bzero(&dev->key1, sizeof(dev->key1));
-      explicit_bzero(&dev->key2, sizeof(dev->key2));
-      dev->key_set = false;
-      return ret;
+      return -EBUSY;
     }
 
-  dev->key_set = true;
-  return OK;
+  if (key == NULL || keylen != BLKCRYPT_KEY_SIZE ||
+      memcmp(key, key + BLKCRYPT_KEY_SIZE / 2, BLKCRYPT_KEY_SIZE / 2) == 0)
+    {
+      return -EINVAL;
+    }
+
+  /* Keep the two expanded keys off the small caller stack, and commit
+   * only after both are valid.  Allocation or expansion failure must not
+   * disable a previously keyed volume.
+   */
+
+  keys = kmm_zalloc(2 * sizeof(*keys));
+  if (keys == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  ret = blkcrypt_xts_setkey(&keys[0], &keys[1], key, keylen);
+  if (ret >= 0)
+    {
+      memcpy(&dev->key1, &keys[0], sizeof(dev->key1));
+      memcpy(&dev->key2, &keys[1], sizeof(dev->key2));
+      dev->key_set = true;
+    }
+
+  explicit_bzero(keys, 2 * sizeof(*keys));
+  kmm_free(keys);
+  return ret;
 }
 
 /****************************************************************************
@@ -241,6 +273,7 @@ static int blkcrypt_open(FAR struct inode *inode)
 {
   FAR struct blkcrypt_priv_s *dev;
   FAR struct inode *parent;
+  int ret;
 
   if (inode == NULL || inode->i_private == NULL)
     {
@@ -248,21 +281,40 @@ static int blkcrypt_open(FAR struct inode *inode)
     }
 
   dev = inode->i_private;
-  parent = dev->parent;
+  ret = nxmutex_lock(&dev->lock);
+  if (ret < 0)
+    {
+      return ret;
+    }
 
+  if (dev->opens == UINT_MAX)
+    {
+      nxmutex_unlock(&dev->lock);
+      return -EMFILE;
+    }
+
+  parent = dev->parent;
+  ret = OK;
   if (parent != NULL && parent->u.i_bops != NULL &&
       parent->u.i_bops->open != NULL)
     {
-      return parent->u.i_bops->open(parent);
+      ret = parent->u.i_bops->open(parent);
     }
 
-  return OK;
+  if (ret >= 0)
+    {
+      dev->opens++;
+    }
+
+  nxmutex_unlock(&dev->lock);
+  return ret;
 }
 
 static int blkcrypt_close(FAR struct inode *inode)
 {
   FAR struct blkcrypt_priv_s *dev;
   FAR struct inode *parent;
+  int ret;
 
   if (inode == NULL || inode->i_private == NULL)
     {
@@ -270,15 +322,33 @@ static int blkcrypt_close(FAR struct inode *inode)
     }
 
   dev = inode->i_private;
-  parent = dev->parent;
+  ret = nxmutex_lock(&dev->lock);
+  if (ret < 0)
+    {
+      return ret;
+    }
 
+  if (dev->opens == 0)
+    {
+      nxmutex_unlock(&dev->lock);
+      return -EINVAL;
+    }
+
+  parent = dev->parent;
+  ret = OK;
   if (parent != NULL && parent->u.i_bops != NULL &&
       parent->u.i_bops->close != NULL)
     {
-      return parent->u.i_bops->close(parent);
+      ret = parent->u.i_bops->close(parent);
     }
 
-  return OK;
+  /* The caller relinquishes this open even if the parent reports an I/O
+   * error while closing; retaining the count would prevent all retries.
+   */
+
+  dev->opens--;
+  nxmutex_unlock(&dev->lock);
+  return ret;
 }
 
 /****************************************************************************
@@ -542,8 +612,8 @@ static int blkcrypt_ioctl(FAR struct inode *inode, int cmd,
  *
  * Description:
  *   有人用 unlink 摘掉 /dev/encdata0 时，系统会叫到这里。
- *   笔记在这里释放。unregister_blockdriver 那条路不会叫到这里，
- *   所以 blkcrypt_unregister 里还会再释放一次；两条路不会同时发生。
+ *   只在没有其他引用时释放。树锁同时保护引用检查和 i_private 摘除，
+ *   防止另一任务刚拿到设备就失去仍在使用的钥匙和草稿纸。
  *
  ****************************************************************************/
 
@@ -557,8 +627,20 @@ static int blkcrypt_unlink(FAR struct inode *inode)
       return -EINVAL;
     }
 
+  inode_lock();
+  if (inode->i_private == NULL || atomic_read(&inode->i_crefs) > 2)
+    {
+      inode_unlock();
+      return -EBUSY;
+    }
+
+  /* The namespace and nx_unlink each hold one reference.  After clearing
+   * i_private, new opens fail until nx_unlink removes the inode itself.
+   */
+
   dev = inode->i_private;
   inode->i_private = NULL;
+  inode_unlock();
   blkcrypt_destroy(dev);
   return OK;
 }
@@ -846,8 +928,10 @@ int blkcrypt_unregister(FAR const char *encdev)
       return ret;
     }
 
+  inode_lock();
   if (inode->u.i_bops != &g_blkcrypt_bops || inode->i_private == NULL)
     {
+      inode_unlock();
       inode_release(inode);
       return -EINVAL;
     }
@@ -863,20 +947,33 @@ int blkcrypt_unregister(FAR const char *encdev)
 
   if (atomic_read(&inode->i_crefs) > 2)
     {
+      inode_unlock();
       inode_release(inode);
       return -EBUSY;
     }
 
-  inode_release(inode);
+  /* Keep our lookup reference and the tree lock through removal.  A new
+   * lookup cannot slip between the busy check and detach.  inode_remove
+   * returns -EBUSY after a successful detach because our reference remains.
+   */
 
-  ret = unregister_blockdriver(encdev);
+  ret = inode_remove(encdev);
+  if (ret == -EBUSY || ret == OK)
+    {
+      inode->i_private = NULL;
+      ret = OK;
+    }
+
+  inode_unlock();
+  inode_release(inode);
   if (ret < 0)
     {
       return ret;
     }
 
-  /* unregister 只摘掉登记卡，不会主动释放 i_private，所以在这里释放。 */
-
   blkcrypt_destroy(dev);
+#ifdef CONFIG_FS_NOTIFY
+  notify_unlink(encdev);
+#endif
   return OK;
 }

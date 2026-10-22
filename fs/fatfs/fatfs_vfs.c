@@ -32,6 +32,7 @@
 #include <assert.h>
 
 #include <nuttx/crc16.h>
+#include <nuttx/atomic.h>
 #include <nuttx/nuttx.h>
 #include <nuttx/fs/fs.h>
 #include <nuttx/fs/ioctl.h>
@@ -68,6 +69,7 @@ struct fatfs_dir_s
 
 struct fatfs_file_s
 {
+  FAR struct fatfs_file_s *next;
   char       path[PATH_MAX + 3];
   FIL        f;
 };
@@ -78,6 +80,8 @@ struct fatfs_mountpt_s
   BYTE                  pdrv;
   mutex_t               lock;
   struct notifier_block nb;
+  FAR struct fatfs_file_s *files;
+  unsigned int          dirs;
 };
 
 struct fatfs_driver_s
@@ -102,6 +106,7 @@ static int     fatfs_ioctl(FAR struct file *filep, int cmd,
                            unsigned long arg);
 
 static int     fatfs_sync(FAR struct file *filep);
+static int     fatfs_syncfs(FAR struct inode *mountpt);
 static int     fatfs_dup(FAR const struct file *oldp, FAR struct file *newp);
 static int     fatfs_fstat(FAR const struct file *filep,
                            FAR struct stat *buf);
@@ -194,7 +199,8 @@ const struct mountpt_operations g_fatfs_operations =
   fatfs_rmdir,         /* rmdir */
   fatfs_rename,        /* rename */
   fatfs_stat,          /* stat */
-  fatfs_chstat         /* chstat */
+  fatfs_chstat,        /* chstat */
+  fatfs_syncfs         /* syncfs */
 };
 
 /****************************************************************************
@@ -395,6 +401,8 @@ static int fatfs_open(FAR struct file *filep, FAR const char *relpath,
     }
 
   filep->f_priv = fp;
+  fp->next = fs->files;
+  fs->files = fp;
 
 errsem:
   nxmutex_unlock(&fs->lock);
@@ -409,6 +417,7 @@ static int fatfs_close(FAR struct file *filep)
 {
   FAR struct fatfs_mountpt_s *fs;
   FAR struct fatfs_file_s *fp;
+  FAR struct fatfs_file_s **link;
   int ret;
 
   fp = filep->f_priv;
@@ -420,6 +429,18 @@ static int fatfs_close(FAR struct file *filep)
     }
 
   ret = fatfs_convert_result(f_close(&fp->f));
+  if (ret >= 0)
+    {
+      for (link = &fs->files; *link != NULL; link = &(*link)->next)
+        {
+          if (*link == fp)
+            {
+              *link = fp->next;
+              break;
+            }
+        }
+    }
+
   nxmutex_unlock(&fs->lock);
   if (ret >= 0)
     {
@@ -655,6 +676,61 @@ static int fatfs_sync(FAR struct file *filep)
   return ret;
 }
 
+/* FatFs synchronizes directory changes in the operations that change them.
+ * File data still in FIL caches must also be written before flushing the
+ * underlying device.  Track every open FIL, including duplicate handles.
+ */
+
+static int fatfs_syncfs_locked(FAR struct fatfs_mountpt_s *fs)
+{
+  FAR struct fatfs_file_s *fp;
+  int ret;
+
+  for (fp = fs->files; fp != NULL; fp = fp->next)
+    {
+      ret = fatfs_convert_result(f_sync(&fp->f));
+      if (ret < 0)
+        {
+          return ret;
+        }
+    }
+
+  /* FatFs does not export its volume-level sync_fs operation.  A failed
+   * directory change can leave its window or bitmap dirty even after all
+   * FILs have synchronized.  A device flush cannot write that RAM state.
+   * Keep the mount alive and report the limitation instead of claiming
+   * durable success.  Do not treat disabled/non-FAT32 FSInfo as dirty.
+   */
+
+  if (fs->fat.wflag != 0 ||
+      (fs->fat.fs_type == FS_FAT32 && fs->fat.fsi_flag == 1)
+#if FF_FS_EXFAT
+      || fs->fat.bitdirty != 0
+#endif
+     )
+    {
+      return -EIO;
+    }
+
+  return disk_ioctl(fs->pdrv, CTRL_SYNC, NULL) == RES_OK ? OK : -EIO;
+}
+
+static int fatfs_syncfs(FAR struct inode *mountpt)
+{
+  FAR struct fatfs_mountpt_s *fs = mountpt->i_private;
+  int ret;
+
+  ret = nxmutex_lock(&fs->lock);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = fatfs_syncfs_locked(fs);
+  nxmutex_unlock(&fs->lock);
+  return ret;
+}
+
 /****************************************************************************
  * Name: fatfs_dup
  *
@@ -708,6 +784,8 @@ static int fatfs_dup(FAR const struct file *oldp, FAR struct file *newp)
   /* Set the private data in the new file descriptor */
 
   newp->f_priv = newfp;
+  newfp->next = fs->files;
+  fs->files = newfp;
 
   nxmutex_unlock(&fs->lock);
   return OK;
@@ -994,6 +1072,7 @@ static int fatfs_opendir(FAR struct inode *mountpt,
   ret = fatfs_convert_result(f_opendir(&fdir->dir, strcat(path, relpath)));
   if (ret >= 0)
     {
+      fs->dirs++;
       *dir = &fdir->base;
     }
 
@@ -1031,6 +1110,11 @@ static int fatfs_closedir(FAR struct inode *mountpt,
     }
 
   ret = fatfs_convert_result(f_closedir(&fdir->dir));
+  if (ret >= 0)
+    {
+      fs->dirs--;
+    }
+
   nxmutex_unlock(&fs->lock);
   if (ret >= 0)
     {
@@ -1319,6 +1403,26 @@ errout_with_fs:
  *
  ****************************************************************************/
 
+/* VFS holds the tree write lock during unbind.  Existing lookups can still
+ * be waiting to enter a callback, so handle counts alone are insufficient.
+ * An unpublished or hidden lower has no matching namespace mount; its
+ * caller must serialize direct callbacks (as encpathfs does).
+ */
+
+static int fatfs_check_refs(FAR struct inode *inode, FAR char *path,
+                            FAR void *arg)
+{
+  (void)path;
+  if (INODE_IS_MOUNTPT(inode) &&
+      inode->u.i_mops == &g_fatfs_operations && inode->i_private == arg &&
+      atomic_read(&inode->i_crefs) > 2)
+    {
+      return -EBUSY;
+    }
+
+  return 0;
+}
+
 static int fatfs_unbind(FAR void *handle, FAR struct inode **driver,
                         unsigned int flags)
 {
@@ -1326,10 +1430,44 @@ static int fatfs_unbind(FAR void *handle, FAR struct inode **driver,
   char path[3];
   int ret;
 
+  ret = nxmutex_lock(&fs->lock);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  if (fs->files != NULL || fs->dirs != 0)
+    {
+      nxmutex_unlock(&fs->lock);
+      return -EBUSY;
+    }
+
+  ret = foreach_inode(fatfs_check_refs, fs);
+  if (ret >= 0)
+    {
+      ret = fatfs_syncfs_locked(fs);
+    }
+
+  if (ret < 0)
+    {
+      nxmutex_unlock(&fs->lock);
+      return ret;
+    }
+
   path[0] = '0' + fs->pdrv;
   path[1] = ':';
   path[2] = '\0';
   ret = fatfs_convert_result(f_unmount(path));
+
+  /* A failed unbind leaves the VFS mount alive.  Its private data and block
+   * reference must remain valid so the caller can retry cleanup safely.
+   */
+
+  if (ret < 0)
+    {
+      nxmutex_unlock(&fs->lock);
+      return ret;
+    }
 
   /* We hold a reference to the driver but should not but
    * mucking with inodes in this context. So, we will just return
@@ -1345,6 +1483,7 @@ static int fatfs_unbind(FAR void *handle, FAR struct inode **driver,
 
   /* Release the mountpoint private data */
 
+  nxmutex_unlock(&fs->lock);
   unregister_reboot_notifier(&fs->nb);
   nxmutex_destroy(&fs->lock);
   fs_heap_free(fs);

@@ -1,0 +1,12 @@
+############################################################################
+# fs/encfs/Make.defs
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+############################################################################
+
+ifeq ($(CONFIG_ENCFSMGR),y)
+CSRCS += encfs_manager.c encfs_key.c encfs_block_port.c
+DEPPATH += --dep-path encfs
+VPATH += :encfs
+endif

@@ -468,7 +468,8 @@ static int mountptrename(FAR const char *oldpath, FAR struct inode *oldinode,
                * rmdir will handle the error cases.
                */
 
-              if (oldinode->u.i_mops->rmdir)
+              if (oldinode->u.i_mops->rmdir &&
+                  !(oldinode->u.i_mops->flags & MOUNTPT_RENAME_OWN_TARGET))
                 {
                   ret = oldinode->u.i_mops->rmdir(oldinode, newrelpath);
                   if (ret < 0)
@@ -489,7 +490,8 @@ static int mountptrename(FAR const char *oldpath, FAR struct inode *oldinode,
                   goto errout_with_newinode;
                 }
 
-              if (oldinode->u.i_mops->unlink)
+              if (oldinode->u.i_mops->unlink &&
+                  !(oldinode->u.i_mops->flags & MOUNTPT_RENAME_OWN_TARGET))
                 {
                   /* Attempt to remove the file before doing the rename.
                    *

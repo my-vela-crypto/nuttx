@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+
+ifeq ($(CONFIG_FS_ENCPATHFS),y)
+CSRCS += encpathfs_mount.c encpathfs_file.c encpathfs_dir.c
+CSRCS += encpathfs_path.c encpathfs_codec.c
+DEPPATH += --dep-path encpathfs
+VPATH += :encpathfs
+endif

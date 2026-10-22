@@ -43,6 +43,12 @@ endif
 ifeq ($(CONFIG_CRYPTO_SW_AES),y)
   CRYPTO_CSRCS += aes.c
 endif
+ifeq ($(CONFIG_CRYPTO_AES_SIV),y)
+  CRYPTO_CSRCS += aes_siv.c
+endif
+ifeq ($(CONFIG_CRYPTO_HKDF_SHA256),y)
+  CRYPTO_CSRCS += hkdf.c
+endif
 CRYPTO_CSRCS += blake2s.c
 CRYPTO_CSRCS += blf.c
 CRYPTO_CSRCS += cast.c

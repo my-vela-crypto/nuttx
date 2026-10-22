@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config FS_ENCPATHFS
+	bool "Authenticated encrypted filename file system"
+	default n
+	depends on !DISABLE_MOUNTPOINT
+	depends on FS_FATFS
+	depends on NAME_MAX >= 234
+	depends on PATH_MAX >= 256
+	select CRYPTO_SW_AES
+	select CRYPTO_AES_SIV
+	---help---
+		A single-volume filesystem proxy using AES-SIV authenticated
+		component names and canonical uppercase Base32hex encoding.
+		The lower mounted filesystem must support syncfs and 234-byte
+		names.  Logical names are printable ASCII, at most 128 bytes.
+		Provision the lower volume explicitly before mounting; normal
+		mounts only validate existing metadata and never format data.

@@ -293,6 +293,8 @@ struct block_operations
  * struct file_operations or struct mountpt_operations
  */
 
+#define MOUNTPT_RENAME_OWN_TARGET (1u << 0)
+
 struct mountpt_operations
 {
   /* The mountpoint open method differs from the driver open method
@@ -384,6 +386,12 @@ struct mountpt_operations
                         FAR const char *relpath,
                         FAR struct stat *buf);
 #endif
+
+  /* A filesystem with this flag handles an existing rename destination
+   * itself.  The VFS must not unlink it before invoking rename.
+   */
+
+  unsigned int flags;
 };
 #endif /* CONFIG_DISABLE_MOUNTPOINT */
 

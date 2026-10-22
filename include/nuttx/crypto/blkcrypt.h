@@ -26,6 +26,7 @@
 
 #include <nuttx/config.h>
 
+#include <stdint.h>
 #include <sys/types.h>
 
 /****************************************************************************
@@ -91,6 +92,8 @@ int blkcrypt_register(FAR const char *encdev, FAR const char *parent);
  *
  *   key 必须指向 32 字节。前 16 字节和后 16 字节不能完全相同。
  *   函数返回后，调用者可以擦掉自己手里的那 32 字节，驱动只保留算好的表。
+ *   已装钥匙的设备被打开或挂载时不能换钥匙；失败时保留旧钥匙。
+ *   DIOC_SETKEY 使用同样的限制，但允许首次装钥匙。
  *
  * Input Parameters:
  *   encdev - 加密盘名字，必须是 blkcrypt_register 创建的那一块
@@ -101,6 +104,8 @@ int blkcrypt_register(FAR const char *encdev, FAR const char *parent);
  *   成功返回 0。失败返回负数：
  *   -EINVAL  长度不是 32，两半钥匙相同，或这个设备不是 blkcrypt
  *   -ENOENT  加密盘还没创建
+ *   -EBUSY   已装钥匙，且设备仍被打开或挂载
+ *   -ENOMEM  临时密钥计算表申请失败
  *
  ****************************************************************************/
 

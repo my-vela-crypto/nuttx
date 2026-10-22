@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig ENCFSMGR
+	bool "Encrypted data volume manager"
+	default n
+	depends on FS_ENCPATHFS && FS_FATFS && BLKCRYPT
+	depends on BOARDCTL_UNIQUEKEY && BOARDCTL_UNIQUEKEY_SIZE = 32
+	depends on !DISABLE_MOUNTPOINT && !DISABLE_PSEUDOFS_OPERATIONS
+	select CRYPTO_HKDF_SHA256
+	---help---
+		Manage a single encrypted volume: /dev/virtblk1 -> /dev/encdata0
+		-> hidden FatFs /datap -> authenticated name layer /data.
+		Normal start only mounts and authenticates existing metadata.
+		The separate provision operation DESTRUCTIVELY formats the data disk
+		as exFAT. The board unique key must provide 32 bytes of key material.
+
+if ENCFSMGR
+
+config ENCFS_TESTING
+	bool "Enable encrypted volume fault injection and test keys"
+	default n
+	---help---
+		Expose test-only APIs for an explicit 32-byte master, a missing master,
+		and one-shot register/key/lower/upper errors. Runtime key replacement
+		is rejected. Do not enable this option in production firmware.
+
+endif

@@ -15,6 +15,23 @@ config CRYPTO_AES
 	bool "AES cypher support"
 	default n
 
+config CRYPTO_AES_SIV
+	bool "AES-SIV authenticated encryption"
+	depends on ALLOW_BSD_COMPONENTS
+	select CRYPTO_SW_AES
+	default n
+	---help---
+		RFC 5297 deterministic authenticated encryption with a 32-byte
+		key (two AES-128 keys), a single associated-data string, and a
+		16-byte synthetic initialization vector.
+
+config CRYPTO_HKDF_SHA256
+	bool "HKDF-SHA256 key derivation"
+	default n
+	---help---
+		RFC 5869 HMAC-SHA256 Extract-and-Expand key derivation, with up
+		to 8160 output bytes.
+
 config CRYPTO_ALGTEST
 	bool "Perform automatic crypto algorithms test on startup"
 	default n

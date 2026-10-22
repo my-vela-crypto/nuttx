@@ -40,7 +40,7 @@ if [[ $# -gt 0 && "${1}" != -* ]]; then
   shift
 fi
 
-OUT="${TOP_DIR}/cmake_out/vela_${CONFIG}"
+OUT="${VELA_BUILD_DIR:-${TOP_DIR}/cmake_out/vela_${CONFIG}}"
 NUTTX_DIR="${TOP_DIR}/nuttx"
 ARTIFACTS=(nuttx nuttx.bin vela_data.bin vela_system.bin)
 
@@ -65,7 +65,7 @@ fi
 
 mkdir -p "${NUTTX_DIR}"
 for artifact in "${ARTIFACTS[@]}"; do
-  ln -sf "../cmake_out/vela_${CONFIG}/${artifact}" "${NUTTX_DIR}/${artifact}"
+  ln -sf "${OUT}/${artifact}" "${NUTTX_DIR}/${artifact}"
 done
 
 echo "Staged emulator artifacts from cmake_out/vela_${CONFIG}/"
