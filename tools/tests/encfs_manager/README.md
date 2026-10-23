@@ -24,6 +24,16 @@ cleanup errors; retrying cleanup without reporting false STOPPED; and explicit
 provisioning versus a normal start on an unformatted volume. Upper target
 reservation is checked for allocation failure and an existing foreign mount.
 
+The manager also reconciles its recorded mount identities against the actual
+inode tree. After a direct external unmount of `/data`, status changes from
+`READY` to `BLOCK_KEYED`; start returns `-EBUSY` until stop releases the remaining
+block device, and the next start mounts the volume normally. The suite covers
+both a missing upper path and a surviving pseudo directory, an externally
+unmounted lower during cleanup, and replacement mounts at either path. Stop
+preserves replacements, including simulated reuse of inode/private-data
+addresses with a different inode serial. Identity checks and unmount run under
+the same inode tree lock so replacement cannot occur between those operations.
+
 The test creates only a temporary host executable and never accesses a real
 block device. It has no network dependencies. `HOSTCC` selects a host compiler.
 `ENCFS_MANAGER_SANITIZERS=undefined` selects UBSan only, and

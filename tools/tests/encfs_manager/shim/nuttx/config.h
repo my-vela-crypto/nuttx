@@ -3,6 +3,7 @@
 #define __ENCFS_TEST_CONFIG_H
 #define CONFIG_ENCFSMGR 1
 #define CONFIG_ENCFS_TESTING 1
+#define DEBUGASSERT(condition) assert(condition)
 #define CONFIG_BOARDCTL_UNIQUEKEY 1
 #define CONFIG_BOARDCTL_UNIQUEKEY_SIZE 32
 #endif

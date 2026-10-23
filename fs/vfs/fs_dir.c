@@ -306,11 +306,21 @@ static off_t seek_mountptdir(FAR struct file *filep, off_t offset)
    * "rewind" to the root dir.
    */
 
-  if (offset < filep->f_pos)
+  /* A failed readdir can consume a backend entry without advancing f_pos.
+   * Rewinding to zero must reset that backend even when f_pos is still zero.
+   */
+
+  if (offset == 0 || offset < filep->f_pos)
     {
       if (inode->u.i_mops->rewinddir != NULL)
         {
-          inode->u.i_mops->rewinddir(inode, dir);
+          int ret = inode->u.i_mops->rewinddir(inode, dir);
+
+          if (ret < 0)
+            {
+              return ret;
+            }
+
           pos = 0;
         }
       else

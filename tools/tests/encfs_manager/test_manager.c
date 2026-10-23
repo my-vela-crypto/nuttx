@@ -55,6 +55,7 @@ static bool g_metadata_close_error;
 static bool g_block_cleanup_error;
 static bool g_target_reserved;
 static bool g_target_foreign;
+static bool g_lower_foreign;
 static bool g_target_allocation_error;
 static int g_upper_fail;
 static int g_formats;
@@ -62,6 +63,12 @@ static int g_initializations;
 static int g_hkdf_calls;
 static unsigned int g_checks;
 static struct inode g_target_inode;
+static struct inode g_lower_inode;
+static ino_t g_inode_serial;
+static uintptr_t g_mount_serial;
+static const struct mountpt_operations g_upper_operations;
+static const struct mountpt_operations g_lower_operations;
+static const struct mountpt_operations g_foreign_operations;
 
 /****************************************************************************
  * Private Functions
@@ -219,6 +226,85 @@ static void test_provision(void)
   CHECK(g_hkdf_calls > 0);
 }
 
+static void test_external_upper_unmount(void)
+{
+  CHECK(encfs_start() == 0);
+  CHECK(nx_umount2(ENCFS_UPPER_PATH, 0) == 0);
+  CHECK(status().state == ENCFS_BLOCK_KEYED && !status().upper_mounted);
+  CHECK(encfs_start() == -EBUSY);
+  CHECK(encfs_stop() == 0);
+  check_stopped();
+  CHECK(encfs_start() == 0);
+  CHECK(encfs_stop() == 0);
+  check_stopped();
+
+  CHECK(encfs_start() == 0);
+  CHECK(nx_umount2(ENCFS_UPPER_PATH, 0) == 0);
+  g_target_reserved = false;
+  CHECK(encfs_start() == -EBUSY);
+  CHECK(status().state == ENCFS_BLOCK_KEYED);
+  CHECK(encfs_stop() == 0);
+  check_stopped();
+}
+
+static void test_foreign_upper_preserved(void)
+{
+  void *previous_handle;
+
+  CHECK(encfs_start() == 0);
+  CHECK(nx_umount2(ENCFS_UPPER_PATH, 0) == 0);
+  g_target_foreign = true;
+  g_target_inode.i_ino = ++g_inode_serial;
+  g_target_inode.u.i_mops = &g_foreign_operations;
+  g_target_inode.i_private = (void *)++g_mount_serial;
+  CHECK(encfs_stop() == 0);
+  CHECK(g_target_foreign);
+  check_stopped();
+  CHECK(encfs_start() == -EBUSY);
+  g_target_foreign = false;
+  g_target_reserved = false;
+  CHECK(encfs_start() == 0);
+  CHECK(encfs_stop() == 0);
+  check_stopped();
+
+  /* Reuse both addresses/ops for a different inode serial.  A pointer-only
+   * identity check must not mistake the foreign mount for the old owner.
+   */
+
+  CHECK(encfs_start() == 0);
+  previous_handle = g_target_inode.i_private;
+  CHECK(nx_umount2(ENCFS_UPPER_PATH, 0) == 0);
+  g_target_foreign = true;
+  g_target_inode.i_ino = ++g_inode_serial;
+  g_target_inode.u.i_mops = &g_upper_operations;
+  g_target_inode.i_private = previous_handle;
+  CHECK(encfs_stop() == 0);
+  CHECK(g_target_foreign);
+  check_stopped();
+  g_target_foreign = false;
+  g_target_reserved = false;
+}
+
+static void test_external_lower_unmount(void)
+{
+  g_upper_fail = 1;
+  g_lower_cleanup_error = true;
+  CHECK(encfs_start() == -EKEYREJECTED);
+  CHECK(status().state == ENCFS_LOWER_MOUNTED);
+  g_lower_cleanup_error = false;
+  g_upper_fail = 0;
+  CHECK(nx_umount2(ENCFS_LOWER_PATH, 0) == 0);
+  CHECK(status().state == ENCFS_BLOCK_KEYED && !status().lower_visible);
+  g_lower_foreign = true;
+  g_lower_inode.i_ino = ++g_inode_serial;
+  g_lower_inode.u.i_mops = &g_foreign_operations;
+  g_lower_inode.i_private = (void *)++g_mount_serial;
+  CHECK(encfs_stop() == 0);
+  CHECK(g_lower_foreign);
+  check_stopped();
+  g_lower_foreign = false;
+}
+
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
@@ -237,12 +323,33 @@ void inode_unlock(void)
 
 int inode_find(struct inode_search_s *desc)
 {
+  return inode_search(desc);
+}
+
+int inode_search(struct inode_search_s *desc)
+{
+  if (!strcmp(desc->path, ENCFS_LOWER_PATH))
+    {
+      if (!g_lower && !g_lower_foreign)
+        {
+          return -ENOENT;
+        }
+
+      g_lower_inode.pseudo = false;
+      g_lower_inode.mounted = true;
+      desc->node = &g_lower_inode;
+      desc->relpath = "";
+      return 0;
+    }
+
+  CHECK(!strcmp(desc->path, ENCFS_UPPER_PATH));
   if (!g_target_reserved && !g_target_foreign)
     {
       return -ENOENT;
     }
 
-  g_target_inode.pseudo = !g_target_foreign;
+  g_target_inode.pseudo = !g_target_foreign && !g_upper;
+  g_target_inode.mounted = g_target_foreign || g_upper;
   desc->node = &g_target_inode;
   desc->relpath = "";
   return 0;
@@ -250,7 +357,7 @@ int inode_find(struct inode_search_s *desc)
 
 void inode_release(struct inode *inode)
 {
-  CHECK(inode == &g_target_inode);
+  CHECK(inode == &g_target_inode || inode == &g_lower_inode);
 }
 
 int inode_reserve_path(const char *path, mode_t mode, struct inode **inode)
@@ -262,6 +369,7 @@ int inode_reserve_path(const char *path, mode_t mode, struct inode **inode)
     }
 
   g_target_reserved = true;
+  g_target_inode.i_ino = ++g_inode_serial;
   *inode = &g_target_inode;
   return 0;
 }
@@ -371,6 +479,9 @@ int nx_mount(const char *source, const char *target, const char *filesystem,
         }
 
       g_lower = true;
+      g_lower_inode.i_ino = ++g_inode_serial;
+      g_lower_inode.u.i_mops = &g_lower_operations;
+      g_lower_inode.i_private = (void *)++g_mount_serial;
       return 0;
     }
 
@@ -393,6 +504,8 @@ int nx_mount(const char *source, const char *target, const char *filesystem,
     }
 
   g_upper = true;
+  g_target_inode.u.i_mops = &g_upper_operations;
+  g_target_inode.i_private = (void *)++g_mount_serial;
   return 0;
 }
 
@@ -436,6 +549,9 @@ int main(void)
   test_upper_failures();
   test_cleanup_failures();
   test_provision();
+  test_external_upper_unmount();
+  test_foreign_upper_preserved();
+  test_external_lower_unmount();
   printf("encfs manager lifecycle: PASS (%u assertions)\n", g_checks);
   return EXIT_SUCCESS;
 }

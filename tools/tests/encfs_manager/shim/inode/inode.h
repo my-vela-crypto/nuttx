@@ -5,12 +5,14 @@
 struct inode_search_s
 {
   struct inode *node;
+  const char *path;
   const char *relpath;
 };
-#define SETUP_SEARCH(desc, path, follow) \
+#define SETUP_SEARCH(desc, p, follow) \
   do \
     { \
       (desc)->node = NULL; \
+      (desc)->path = (p); \
       (desc)->relpath = ""; \
     } \
   while (0)
@@ -18,6 +20,7 @@ struct inode_search_s
 void inode_lock(void);
 void inode_unlock(void);
 int inode_find(struct inode_search_s *desc);
+int inode_search(struct inode_search_s *desc);
 void inode_release(struct inode *inode);
 int inode_reserve_path(const char *path, mode_t mode, struct inode **inode);
 #endif

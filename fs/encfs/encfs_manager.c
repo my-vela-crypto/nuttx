@@ -12,7 +12,9 @@
 #include <nuttx/config.h>
 
 #include <sys/stat.h>
+#include <assert.h>
 #include <errno.h>
+#include <string.h>
 
 #include <nuttx/fs/encpathfs.h>
 #include <nuttx/fs/fs.h>
@@ -27,6 +29,21 @@
 
 static mutex_t g_lock = NXMUTEX_INITIALIZER;
 static struct encfs_status_s g_status;
+
+/* Remember identities, without retaining a reference that would prevent an
+ * ordinary umount.  The inode serial also distinguishes a new mount whose
+ * allocation reuses the old inode/private-data addresses.
+ */
+
+struct encfs_mount_s
+{
+  ino_t ino;
+  FAR const struct mountpt_operations *ops;
+  FAR void *handle;
+};
+
+static struct encfs_mount_s g_upper;
+static struct encfs_mount_s g_lower;
 
 #ifdef CONFIG_ENCFS_TESTING
 static enum encfs_test_failpoint_e g_failpoint;
@@ -78,6 +95,130 @@ static void encfs_clear_error(void)
   g_status.cleanup_stage = ENCFS_STAGE_NONE;
 }
 
+/* Call with the inode tree locked.  A path may have disappeared, become a
+ * pseudo directory, or been reused by an unrelated mount since the last
+ * manager operation.  Never claim or unmount that replacement.
+ */
+
+static int encfs_mount_present(FAR const char *path,
+                               FAR struct encfs_mount_s *identity)
+{
+  struct inode_search_s desc;
+  FAR struct inode *inode;
+  int ret;
+
+  SETUP_SEARCH(&desc, path, true);
+  ret = inode_search(&desc);
+  if (ret >= 0)
+    {
+      inode = desc.node;
+      ret = INODE_IS_MOUNTPT(inode) && desc.relpath[0] == '\0' &&
+            inode->i_ino == identity->ino &&
+            inode->u.i_mops == identity->ops &&
+            inode->i_private == identity->handle;
+    }
+  else if (ret == -ENOENT)
+    {
+      ret = 0;
+    }
+
+  RELEASE_SEARCH(&desc);
+  return ret;
+}
+
+static int encfs_refresh_mounts(void)
+{
+  int ret;
+
+  if (g_status.upper_mounted)
+    {
+      ret = encfs_mount_present(ENCFS_UPPER_PATH, &g_upper);
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      if (ret == 0)
+        {
+          /* Successful encpathfs unbind also released its hidden lower. */
+
+          g_status.upper_mounted = false;
+          g_status.lower_visible = false;
+          memset(&g_upper, 0, sizeof(g_upper));
+          memset(&g_lower, 0, sizeof(g_lower));
+        }
+    }
+
+  if (g_status.lower_visible)
+    {
+      ret = encfs_mount_present(ENCFS_LOWER_PATH, &g_lower);
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      if (ret == 0)
+        {
+          g_status.lower_visible = false;
+          memset(&g_lower, 0, sizeof(g_lower));
+        }
+    }
+
+  encfs_update_state();
+  return 0;
+}
+
+/* Keep publication and identity capture atomic with respect to an external
+ * umount/mount.  Refuse aliases and occupied targets.  After nx_mount has
+ * succeeded under the tree lock, lookup cannot lose the published inode.
+ */
+
+static int encfs_mount(FAR const char *source, FAR const char *target,
+                       FAR const char *filesystem, FAR const void *data,
+                       FAR struct encfs_mount_s *identity)
+{
+  struct inode_search_s desc;
+  int ret;
+
+  inode_lock();
+  SETUP_SEARCH(&desc, target, true);
+  ret = inode_search(&desc);
+  if (ret >= 0)
+    {
+      ret = INODE_IS_PSEUDODIR(desc.node) && desc.relpath[0] == '\0' ?
+            0 : -EBUSY;
+    }
+  else if (ret == -ENOENT)
+    {
+      ret = 0;
+    }
+
+  RELEASE_SEARCH(&desc);
+  if (ret >= 0)
+    {
+      ret = nx_mount(source, target, filesystem, 0, data);
+    }
+
+  if (ret >= 0)
+    {
+      SETUP_SEARCH(&desc, target, true);
+      ret = inode_search(&desc);
+      DEBUGASSERT(ret >= 0 && INODE_IS_MOUNTPT(desc.node) &&
+                  desc.relpath[0] == '\0');
+      if (ret >= 0)
+        {
+          identity->ino = desc.node->i_ino;
+          identity->ops = desc.node->u.i_mops;
+          identity->handle = desc.node->i_private;
+        }
+
+      RELEASE_SEARCH(&desc);
+    }
+
+  inode_unlock();
+  return ret;
+}
+
 /* Reserve the upper pseudo directory before bind can take ownership of the
  * lower mount.  With an existing target, nx_mount has no allocating/failing
  * publication step after bind.  This avoids a VFS error path that ignores an
@@ -90,7 +231,7 @@ static int encfs_prepare_upper(void)
   FAR struct inode *inode;
   int ret;
 
-  SETUP_SEARCH(&desc, ENCFS_UPPER_PATH, false);
+  SETUP_SEARCH(&desc, ENCFS_UPPER_PATH, true);
   inode_lock();
   ret = inode_find(&desc);
   if (ret >= 0)
@@ -168,9 +309,15 @@ static int encfs_release_error(enum encfs_stage_e stage, int ret,
  * the complete running chain and the caller may retry after closing handles.
  */
 
-static int encfs_release(bool rollback)
+static int encfs_release_locked(bool rollback)
 {
   int ret;
+
+  ret = encfs_refresh_mounts();
+  if (ret < 0)
+    {
+      return encfs_release_error(ENCFS_STAGE_UPPER_UMOUNT, ret, rollback);
+    }
 
   if (g_status.upper_mounted)
     {
@@ -185,6 +332,8 @@ static int encfs_release(bool rollback)
 
       g_status.upper_mounted = false;
       g_status.lower_visible = false;
+      memset(&g_upper, 0, sizeof(g_upper));
+      memset(&g_lower, 0, sizeof(g_lower));
     }
 
   if (g_status.lower_visible)
@@ -222,6 +371,7 @@ static int encfs_release(bool rollback)
         }
 
       g_status.lower_visible = false;
+      memset(&g_lower, 0, sizeof(g_lower));
     }
 
   if (g_status.block_registered)
@@ -240,6 +390,20 @@ static int encfs_release(bool rollback)
   return 0;
 }
 
+static int encfs_release(bool rollback)
+{
+  int ret;
+
+  /* Serialize the identity check and unmount itself.  Checking first and
+   * unlocking would allow another task to replace the mount in between.
+   */
+
+  inode_lock();
+  ret = encfs_release_locked(rollback);
+  inode_unlock();
+  return ret;
+}
+
 /* Start and provision share block/key acquisition, but only provision passes
  * forceformat.  Plain start must never pass autoformat or create metadata.
  */
@@ -247,7 +411,6 @@ static int encfs_release(bool rollback)
 static int encfs_acquire(bool provision)
 {
   struct encfs_keys_s keys;
-  struct stat st;
   int clearret;
   int ret;
 
@@ -304,8 +467,8 @@ static int encfs_acquire(bool provision)
       goto fail;
     }
 
-  ret = nx_mount(ENCFS_BLOCK_DEVICE, ENCFS_LOWER_PATH, "fatfs", 0,
-                 provision ? "forceformat" : NULL);
+  ret = encfs_mount(ENCFS_BLOCK_DEVICE, ENCFS_LOWER_PATH, "fatfs",
+                    provision ? "forceformat" : NULL, &g_lower);
   if (ret < 0)
     {
       goto fail;
@@ -343,12 +506,13 @@ static int encfs_acquire(bool provision)
       goto fail;
     }
 
-  ret = nx_mount(NULL, ENCFS_UPPER_PATH, "encpathfs", 0,
-                 "lower=" ENCFS_LOWER_PATH ",root=.p,slot=0");
+  ret = encfs_mount(NULL, ENCFS_UPPER_PATH, "encpathfs",
+                    "lower=" ENCFS_LOWER_PATH ",root=.p,slot=0", &g_upper);
   if (ret >= 0)
     {
       g_status.upper_mounted = true;
       g_status.lower_visible = false;
+      memset(&g_lower, 0, sizeof(g_lower));
     }
   else
     {
@@ -358,10 +522,9 @@ static int encfs_acquire(bool provision)
        * bind failures leave /datap visible for our rollback.
        */
 
-      if (nx_stat(ENCFS_LOWER_PATH, &st, 0) == -ENOENT)
-        {
-          g_status.lower_visible = false;
-        }
+      inode_lock();
+      encfs_refresh_mounts();
+      inode_unlock();
     }
 
   /* bind consumes its key slot on all paths.  A failure before bind (e.g. an
@@ -413,19 +576,28 @@ int encfs_start(void)
       return ret;
     }
 
-  if (g_status.upper_mounted)
+  inode_lock();
+  ret = encfs_refresh_mounts();
+  if (ret >= 0)
     {
-      ret = 0;
-    }
-  else if (encfs_has_resources())
-    {
-      ret = -EBUSY;
-    }
-  else
-    {
-      ret = encfs_acquire(false);
+      if (g_status.upper_mounted)
+        {
+          ret = 0;
+        }
+      else if (encfs_has_resources())
+        {
+          ret = -EBUSY;
+        }
+      else
+        {
+          inode_unlock();
+          ret = encfs_acquire(false);
+          nxmutex_unlock(&g_lock);
+          return ret;
+        }
     }
 
+  inode_unlock();
   nxmutex_unlock(&g_lock);
   return ret;
 }
@@ -454,13 +626,12 @@ int encfs_provision(void)
       return ret;
     }
 
-  if (encfs_has_resources())
+  inode_lock();
+  ret = encfs_refresh_mounts();
+  inode_unlock();
+  if (ret >= 0)
     {
-      ret = -EBUSY;
-    }
-  else
-    {
-      ret = encfs_acquire(true);
+      ret = encfs_has_resources() ? -EBUSY : encfs_acquire(true);
     }
 
   nxmutex_unlock(&g_lock);
@@ -482,9 +653,16 @@ int encfs_get_status(FAR struct encfs_status_s *status)
       return ret;
     }
 
-  *status = g_status;
+  inode_lock();
+  ret = encfs_refresh_mounts();
+  if (ret >= 0)
+    {
+      *status = g_status;
+    }
+
+  inode_unlock();
   nxmutex_unlock(&g_lock);
-  return 0;
+  return ret;
 }
 
 #ifdef CONFIG_ENCFS_TESTING
